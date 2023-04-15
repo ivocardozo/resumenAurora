@@ -1,0 +1,504 @@
+we've launched MySQL 8.0 a couple of weeks ago, as well as improved read replica availability
+and Graviton instance support for both flavors. So let's dig into the architecture a bit
+Aurora storage and replicas
+'cause this is a deep dive talk so we'll try and go deep on especially in the storage tier. Okay, so first of all,
+Aurora always runs in three Availability Zones. So we're always gonna be spread across those three AZs
+and that's for our storage tier. You don't have to have three AZs, obviously, for the server side, but storage will always be spread across those three AZs.
+We always have a picture that looks like this with a couple of blocks in it, but it's a misrepresentation of what's actually happening.
+Behind the scenes, each one of those blocks is tens to hundreds of servers. So we'll spread your storage out
+across three Availability Zones, across hundreds to thousands of servers, we'll store your data in 10-gig segments across that fleet
+with six copies of your data spread across those three Availability Zones. That's one of the reasons we can claim such high durability numbers for Aurora,
+plus we store everything from a backup perspective out to S3.
+So in a typical single AZ deployment of Aurora, you would have a single instance
+of either Postgres or MySQL. That's gonna be your writer node. It's going to get a quorum connection
+to your Aurora storage. It's gonna open it for read/write intent, and then your applications, from wherever they are,
+can connect up to that instance and it's gonna query the storage. Your storage, as I mentioned a moment ago,
+is going to be in 10-gig blocks spread out across the three Availability Zones.
+Now, the representation here isn't meant to say that all of your storage is in one given AZ, simply that we spread that storage out
+across those Availability Zones. We do this for reliability and also for scalability.
+When I go to issue a write, for example, I, say, insert into my table value's 1, commit transaction.
+Okay, very straightforward, the log needs to be written out to storage. We will actually issue six asynchronous writes
+to the Aurora storage tier, one for each location where we know that your storage is targeted at.
+So each one of those, logically speaking, is a machine in the Aurora storage network, we will send that commit down.
+When four out of six of those commits are acknowledged, and I'll go in gory detail in a few slides
+on exactly what that means and how we go through the process and decide when it's hardened, when four out of six of those nodes are hardened,
+the transaction is considered done, and we'll send back an acknowledgement to the actual Postgres or MySQL server
+saying that the transaction has been committed or the log write has otherwise been done.
+For a read, most of the time, the vast majority of the time,
+you will read from a single node in your cluster. Now, why is that? Because one of the things that makes Aurora different
+than regular Postgres or MySQL is the intelligence is built into the storage tier
+that would normally happen up on the relational tier. So if I am going to do that same insert
+that I talked about before, I'm going to update the data page or the block, depending on which database you're talking about and the terminology they prefer, in memory.
+And then eventually, I'm gonna copy that data page down to disk. And again, I'll talk more about that a bit later.
+In Aurora, we don't do that. We just send the log records down and then the storage layer replays those log records
+and updates the data pages, and then makes a copy of those data pages out to S3.
+When I ask Aurora storage for the latest copy of a data page,
+it knows what version of that page it has. So if I happen to ask on a local server,
+I go to the first one I wanna talk to and it has the right version, it can just send it to me.
+Well, what if it doesn't have the right version? It can build one 'cause it's got all the logs. So it can build the right version of the page
+and then quickly send it back. Now, most of the time, you won't wait for that because it will have already happened.
+Now, if you read some of the white papers we've published, we often talk about three out of six for reads, but the one out of six is the optimization
+that you'll actually encounter most of the time. Okay, so in this next issue here,
+we've lost a 10-gig segment. So then what happens in the Aurora storage fleet?
+It turns out that, at the scale of something like an Aurora storage network, this happens all the time.
+So one of the storage nodes has some kind of failure. In this case, maybe that 10-gig block got corrupted,
+a CRC check failed, something like that. Okay, so what do we do? I just told you a minute ago, we have six copies of your data.
+So what happens if one of them gets corrupted? We go grab another copy from somewhere else,
+preferably the same AZ but it doesn't have to be, right? Some copy that's electrically near us and we make a copy of that 10-gig segment and replace it,
+so we self-repair. Now, because you only need four out of six to commit and get a quorum,
+it has no effect whatsoever on availability because you are still at five out of six. So we repaired it and you never know it happened,
+there won't be an entry in your log, just no need for you to know, it just self-heals.
+What happens if we lose an entire storage server? It's, logically speaking, exactly the same process,
+except now the workload's gonna spread out across multiple other servers, or we provision new servers
+and add them to the Aurora fleet, either one. But either way, again, doesn't matter.
+So you went down to five out of six, we make a copy, we get it up and running, we spread it out again,
+and it just works. Same exact issue, by the way, if one of these storage nodes get busy.
+So imagine that storage node there with the block on it, wasn't down, it didn't fail,
+it's just really, really busy. So what do we do? We start spreading the load out across other storage nodes
+and spread the workload until it's not busy anymore. Again, all completely transparent to you. The storage fleet here is the intelligence
+that really makes the difference in Aurora. What about read replicas?
+We support up to 15 read replicas per cluster so the read replica's gonna be instantiated.
+If you're only gonna do one, you would wanna do it very much like what's on the slide. You'd wanna put it in a different Availability Zone
+so that if you need to failover, the replica target is in a different AZ. That way, if something went wrong in an AZ,
+it's gonna be able to take over and run. It also opens the exact same storage.
+So unlike in a traditional Postgres or MySQL environment like RDS, or if you were doing it yourself or building it on EC2,
+there's not a separate copy of the storage for the read replicas. So I'm gonna talk to the same Aurora storage fleet
+and I'm gonna open that fleet, except now in read-only mode, and use that for my database.
+You'll also see that blue line going from the read replica, or rather from the writer node over to the read replica.
+What that's doing is if I'm performing that same insert that we talked about a moment ago,
+I insert into table t1, add a value, I'm going to ship that log record down to Aurora storage.
+I'm actually gonna send six copies of it down and get an update from that. Simultaneously with that,
+I'm asynchronously going to ship it to the read replicas. And then on the read replica,
+it's gonna read that log entry and say, "Do I have this page in memory?" If I do, update my local buffer pool.
+It's strictly an optimization to make sure I don't have to go back to the storage fleet every time I wanna see if my page is up to date.
+So we'll stream the log records across to the read replica, as well as being able to get all of the data pages
+directly from storage. What happens if t1 wasn't in the buffer pool for my read replica?
+We throw the log update away. We don't care about it. It's not like we're gonna send it to storage. The writer's responsible for that.
+Okay, I mentioned before we can have 15 read replicas. Do be aware that every single read replica
+is gonna have to get that log stream from the writer node. So it's not free to add 15 read replicas.
+There is a load that's gonna be placed on the writer node. Now, it's not dramatic, but it is a load
+and you do wanna be conscious of that. So each one of those connections will have a log record flowing to it.
+And each one of those is going to open up the Aurora storage network to access the data.
+Okay, now let's talk about failures up a little higher in the stack. So what happens if my database crashes?
+So it happens, right? We'd prefer that the database never crashes,
+but if it does, for the most part, we do what you'd think of as the common sense thing, we try and restart the database process.
+So if MySQL or Postgres dies, we attempt to restart it. We use the same machine, we're running on EC2 hosts here, it's not magic there.
+So we'll take your EC2 host, if there's some peripheral thing
+that needs to be cleaned up, we'll do a quick cleanup, and then we'll restart your process. The buffer pool lives in a separate address space,
+so we don't lose the buffer pool when we have to restart Postgres or MySQL. So that's the normal failure scenario, I would say,
+for Postgres or MySQL, is a restart on that same server. If we can't do that or if the server's really gone,
+then what happens? Then we failover to the appropriately provisioned read replica
+that you've identified as the highest priority target for a read replica failover, and that's why it's so important to have that replica.
+Now, why did I suggest we have it in a different AZ? It's because what if that failure wasn't my EC2 host,
+but the entire Availability Zone? What's an Availability Zone? Just a quick refresher.
+It is one or more physical data centers. So for an AZ to go offline,
+something tragic happened to the building or somebody used a backhoe in front of a large set of fiber cables,
+I've seen all of those failures, but in any event, temporarily speaking or permanently,
+you can't get to that AZ. So it's much better for you, from an availability perspective, if you failover. Makes no difference whatsoever to the storage.
+The storage has still got what? Four out of six, right? So I'm still up and running.
+Now, am I at higher risk that something could go wrong? Theoretically, absolutely, but I'm still up and running with four out of six
+when I lose an entire Availability Zone. Okay, so we've got a feature, Global Database for Aurora,
+Amazon Aurora global database
+that we've designed for disaster recovery. The way Global Database works is it takes a copy of the Aurora storage
+and says, "I'm going to put a copy of that storage in a different region." So in this scenario, for example,
+let's say your server on the left, or your region on the left rather, is Oregon, and the region on the right, let's say, is Virginia.
+So I'm going to say my primary cluster is in Oregon.
+That's where my read/write connection is gonna be and that's where all writes need to happen. Now, you go into the console or through the CLI,
+and you say, "I want Global Database and I want it to be in Virginia." So we'll set up a copy of a cluster with Aurora storage.
+Behind the scenes, we're provisioning some replication servers or using an existing fleet of replication servers,
+either one will happen, so we'll set up some replication agents on those servers or provision those servers,
+and then we'll copy all the data across. We'll make a synchronous copy, all of this happening on the Amazon backbone.
+Then what happens when you make a change? I recognize my sample is rather simple
+but insert into t1 values 1. Do it again. And now what happens? So I'm gonna have to send that log record out,
+I'm gonna send that to the read replicas. Guess what global database looks like to the writer?
+It's a read replica. So I send it out, it goes out to the replication server as a read replica,
+and, in fact, it takes a read replica slot. So now I can't have 15 read replicas of my cluster, I can have 14 because I have the 15th as Virginia.
+That request gets sent down to the replication server, sent across the backbone, and applied to storage.
+And guess what? We've got disaster recovery because now I've got a full copy of all my data,
+with six copies, as a matter of fact, not just a full copy, but six copies spread across three AZs in another region.
+Now, something you'll notice here, I don't have any servers running in Virginia.
+It's totally fine. Works great. The storage is there. Anytime you wanna go in and add a server to that cluster,
+you can do so, but it works perfectly fine in a headless configuration.
+If I want to, I can add read replicas there, and the nice thing about that
+is that it doesn't count as additional read replicas. The remote region is one read replica
+and you can have 15 read replicas in there and it's all gonna work.
+Now, what happens when a change comes through? It's gonna go to the read replica
+and invalidate the cache, if there's a matching page, in exactly the same way it would've done before,
+and it will go simultaneously to the storage tier and update the storage.
+I can have several, I can spread those out, and I can run my read queries in the remote region.
+Usually you'd wanna do this, obviously, to reduce latency. That's sort of the number one reason,
+and to take advantage of the fact that you paid for the DR solution so you may as well use it. I've seen lots of folks do both.
+So as changes come in, they're gonna replicate across, they're gonna continue to go across the Amazon backbone
+and into that storage fleet on the other side, and it's just gonna keep it up to date. So now what happens if, heaven forbid,
+we have a regional failure? Now, most of the times, what's gonna be a regional failure? It's gonna be a software deployment that went bad,
+a network connection that went bad, some misconfiguration that we did that screwed things up,
+or some natural disaster, all of the above could theoretically happen and take a region out.
+So you've paid to have us have a DR copy of your database and we've got that copy.
+When you replicate data from a writer to a read replica, it's always asynchronous inside of the cluster.
+It's also always asynchronous when it goes across the network for disaster recovery.
+So what does that mean if I have a crash or I don't otherwise know the state of the region?
+It means if I were to failover, there might be data loss. Because I've made asynchronous copies of your data,
+I don't know if all of the copies of the data and all the log changes made it to the remote region.
+For that reason, we require you to manually promote the remote replica.
+So you have to choose to do a failover cross-region because there might be data loss.
+So you go into the console or through the CLI again and promote that region to now be the writer region.
+We disconnect you from the region that's failed so you're no longer in the console, you'll notice that it's no longer affiliated
+with the original region, it'll now be a standalone cluster, and it's open for read/write.
+From that point on, it's literally just an ordinary Aurora cluster.
+Well, what about lots of these? I could have a good use case for one region for DR,
+but what about that data locality issue? Couldn't I say, "Hey, I've got Oregon and Virginia,
+but why not throw in Ireland? And why not throw in Singapore? Works perfectly fine, we'll do up to five regions,
+we'll keep it up to date. As you might imagine, latency starts to be a real issue
+when you start crossing oceans. So do be aware that if you are replicating,
+for example, from Oregon to Singapore, you're gonna have a bit more latency
+from, say, Oregon to Virginia, or a lot of people will replicate Virginia to Ohio
+for exactly that reason. Each region counts as a replication slot.
+So now, in this configuration, I can have 12 readers in my original cluster.
+So remember that when you're adding these remote regions, but guess what? Each of these remote regions can have as many readers as you want,
+up to 15, doesn't affect the reader count. They're all gonna send those asynchronous connections across the network and update it.
+You'll notice in this example, I've also got Region D as headless in addition to having some read replicas
+in the other regions. And, again, all of that's just gonna work transparently, that's part of the service we're offering.
+For Aurora MySQL, we have a feature called Global Database Write Forwarding.
+So in Global Database Write Forwarding, what we offer is a solution to this problem.
+I've got an application running in my same scenario as before, so I've got Oregon and Virginia, and this application in Virginia
+tries to issue that insert statement. Well, the database is open/read-only, it can't issue a write to the cluster
+so it'll get a failure message. But I could work around that, right? In my application,
+I could make a connection back to the cluster in Oregon and issue that insert statement.
+I could, but that's a lot of work for me, and then I've gotta wait for it to replicate back just like you'd expect.
+But what I can do in MySQL is enable Global Database Write Forwarding.
+Once I've done that, that insert statement will now magically process or will appear to magically process to you.
+What, in fact, is happening is exactly what you might expect. We forward the insert statement across the network to Oregon,
+to the writer node there, and issue the insert. Then what do you think happens?
+It replicates it back exactly the same as any other change would've come across and it shows back up on the server.
+This is not something you wanna do to get the same throughput as you would get from a writer.
+This is meant for the occasional application that has, "Oops, I forgot, I ran an insert, an update, or a delete."
+It is not meant as a scalability mechanism. It's meant as a mechanism to prevent you
+from having to do an occasional write operation.
+All right, let's shift gears and talk a little bit more at the next layer down, inside of the picture of Aurora storage.
+Aurora PostgreSQL: Writing less
+Why do we claim that we have better throughput than regular Postgres or regular MySQL?
+It's largely based in the fact that A, we have scale-out storage, but B, we do less work.
+And here's an example of what we're talking about. This is sort of a classic example of Postgres.
+I've got a block in memory, which is Postgres term for a page, and I've got my write-ahead log or WAL log.
+I update t and set y = 6. So what's gonna happen? Well, we're gonna put a copy of that image into the log
+and we're gonna put a full copy of that data page into the log as well, and I'll explain why in just a second.
+Then we're gonna continue to make some changes on the table. Those changes are gonna continue to be logged.
+Now, regular relational databases, and by regular, I mean Oracle, SQL Server, Db2, everybody does a checkpoint operation.
+A checkpoint says take all of the changed pages in memory and push them out to the disk to harden them.
+So what's gonna happen? Well, we're gonna write that data page to the data file, or probably in tens, hundreds, thousands of data pages,
+and we're gonna write the log records out to the archive location. And in our case, for example,
+if this were already Postgres, that would be S3. But Postgres page sizes are 8K
+and we're running on Linux and Linux has a page size of 4K. So what happens if half of the page writes
+and the other half doesn't? We call this a torn page. I've got a problem here, I've logically got corruption,
+so how do I recover from that? Well, that's very straightforward. I've got a full copy of that page in my log file
+so I can apply that page to my data file and then roll forward all the log entries to recover.
+That's great, works really well, and you get recovery in a few minutes.
+So reliable mechanism, makes a lot of sense, just works. What happens in Aurora?
+So update t set y = 6. Okay, so I make that change
+and I put that log record in the log queue and then push that log record down to Aurora storage, okay?
+Do another insert, push that log record down. We don't do checkpoints.
+We didn't write any of the data pages. Why is that? Because the Aurora storage tier is intelligent.
+It knows how to take log records, replay them, and turn them into data pages, so we don't need to ever push the data pages down.
+So we do a lot less work, we do a lot less I/O from not having to push these data pages down to disk.
+That's part of why we can get more throughput in Aurora than we could with a regular instance of Postgres.
+Okay, so in this case, what's happening behind the scenes is we're continuously performing recovery
+in the storage fleet. So when you recover with Aurora, you can recover significantly faster
+because we've already recovered. We're doing it all the time in the storage fleet. So when you restart the database and say, "Catch me up,"
+it's like, "Okay." So it's quite quick. And of course, at all times, we're hardening all of those log record changes
+into S3 as well. Very, very similar story in MySQL so I'll go a little faster through this.
+Aurora MySQL: Writing less
+Do my insert, do my checkpoint, MySQL has a different philosophy on how they do logging
+so they write this full block into what's called a doublewrite buffer, then they write to the data file,
+and they archive out the log records. Same problem except bigger because MySQL data page, by default, is 16K.
+So I get the same problem. How do I recover? I copy the full block over and put it in place
+and then roll forward any log entries. But I still have to do checkpoint, and, in fact, in MySQL I'm writing even more.
+So what's the Aurora story? This is gonna look a little familiar so I'll go really quick. It's write the log records down to storage
+and have them update the data pages. So no engine checkpoints, no doublewrite buffer,
+so a lot less work going on. And, again, the recovery's happening continuously in the background.
+So MySQL and Postgres work fundamentally identically from that feature perspective.
+Now let's go inside of an Aurora storage node. So there's actually a number of different types of computers
+being used inside of the Aurora storage fleet. A couple of them you've seen on the slides, we have replication servers
+that hold replication agents to do Global Database. The key component that you see represented on all of our slides whenever we present at a conference
+or talk about Aurora in a sales call or something, is gonna be these storage nodes.
+So a storage node is going to be the target for when you're issuing those insert, update,
+or delete operations and pushing those log records down. So I've got an Aurora read/write node.
+I make a change, change A, or LSN1 if you wanna think of it as LSNs,
+comes down into the incoming queue, we make sure we've actually got that log record, we push it down into our hot log.
+At that point, we acknowledge that record A has been received. So when I talked about pushing six writes down
+and waiting for four of them to come back, that's when we acknowledge that that log record has been received,
+because it's been pushed from memory into something more durable. Now I push record C through.
+It comes down into my incoming queue and pushes into my hot log. But as you may have gotten a hint
+from the fact that the slide shows a gap, it turns out there was a record B change. How do we know that?
+Because we know the log sequence numbers and we recognize that, hey, there's something missing there. So what do we do?
+Well, we talk to our peers in the Aurora storage fleet and say, "Hey, anybody got a copy of B?"
+So somebody says, "Yep, I've got a copy of B, here you go." They send that to us.
+We get a coalesced version of the log that we're comfortable with, that is we're sure is the right sequence
+and it's periodic intervals. We'll now push those log records out into the update queue
+and then we'll go through and update the data pages that were affected by those log records. Guess what?
+At all times, we're also continuously pushing the hot log down to S3 for preservation, for recovery.
+Our official stance, if you read the documentation, is five-minute recovery. In practice, we're sending those log records down
+pretty much continuously. And then guess what? Just like you'd expect, we also push the data pages down
+so that we can recover faster so we don't have to place so many log records.
+Now, because of that, when that read request comes in, I've got an updated version of my data page with all of my log records applied.
+So at any given moment, I've always got the latest version, or in Postgres's case, multiple versions of the data page,
+depending on which version you wanna ask for, or we can build it because we have all the log records handy.
+Fast clones
+Okay, what about cloning? Another cool feature we've got in Aurora that I think is actually an underused feature
+is fast clones. So what a clone allows you to do is spin up another cluster for Aurora.
+It'll otherwise look exactly the same as any other cluster that you would create but it's going to get a copy of your data
+from the original cluster that you're cloning. Logically speaking, it's getting a copy.
+What's actually going to happen is what I'm gonna show you here on the slide. So we go ahead and spin up a clone
+because we wanna go do something like run a large series of reports and we'd rather not interfere with our production workload.
+And maybe we wanna run two or three index creates that are unique to the reporting application, we don't want it to screw up our OLTP work,
+and then I wanna run those indexes, create them, run my reports, and then throw it all away,
+and then I'll do it all over again next week, for example. So I create a clone of my Aurora cluster, particularly handy if that Aurora cluster's,
+say, 100 terabytes, right? It's much, much faster because I don't actually create a copy of the data.
+I create a logical set of pointers to the data and that's the storage for the clone.
+So creating a clone just takes a few minutes. You spin up the head node instance and then you're actually pointing
+at your original server's storage. So how does that work? I have my reporting application.
+Now I come in, I run a query, I'm gonna go fetch the data. Well, if the data hasn't changed
+from the time I asked for the clone to be created, I go back and I grab the copy of the data that was from the original cluster.
+Has no effect whatsoever on the primary cluster because this storage fleet isn't 5 or 6 or 10 or 20 boxes,
+it's hundreds to thousands. So that node gets the data from the original clusters,
+10-gig segment, I show pages here, but, you know, it's reading out of the 10-gig segments, and then grabs that up and returns it to the instance
+that was the clone. Now what happens if I make a change? I told you I wanted to create an index. So I go create a change,
+we make a copy of the original server's page, so you can think of this as thin provisioning in a way,
+I make a copy of that page and then make the change there. Again, no effect whatsoever on the original server.
+It doesn't know you made a change 'cause it knows nothing about this new page. So we can do that all we want, we can insert new rows,
+add new data pages, works perfectly fine. By the way, this is a fantastic use case for testing blue/green deployments.
+You can, for example, get out there and create new indexes and then see what happens on your actual production data
+instead of guessing on a test system. Now, what happens, I haven't mentioned at all, my original cluster,
+it's gonna make changes, right? So it comes in, at least usually, it's going to be busy doing something,
+and guess what? When I add new data, it's only up there on top because the clone will be
+as of the time you asked for the clone to be created, and we'll give you a version of the data as of that moment.
+So anything that's inserted, updated, or deleted, new data is added, it's not reflected in the clone.
+I come down here though and I change an existing data page. We're gonna make a copy of the data page for your clone.
+So the storage network knows about the clone, the write node in your cluster doesn't, so this is nothing you do, you won't see any impact on your server,
+it's just happening down in the storage fleet. It makes a copy of the before image, before it makes the change,
+so that your clone has full access to that data.
+Storage management - Dynamic resizing
+Another thing we added recently, or fairly recently, was the ability to dynamically resize your database.
+So this is a handy feature that'll save you money. So let's imagine we've got a scenario
+that's set up on the slide here. I've got a bunch of partitions of a database, so I've got enough partitions
+that I can fill each one up on a regular time interval and we suppose, for the case of the example here,
+that normally we fill up the same amount of data. So you see over the progression of time here,
+I add partition, I add partition, I add partition, we fill it with some data, and roughly speaking, I get to a steady state.
+So I get to a steady state, I've got the same number of partitions. As I roll off partitions and add new ones,
+my storage is roughly gonna stay the same. But then something happens and I get a big spike. Let's say it's Cyber Monday
+and people are placing some orders and you're now still gainfully employed, so all that's great. But it causes a big spike in the data storage,
+and then it happens for another set of intervals of time, so now I've got lots more data than I had before.
+In fact, I've doubled the size of my storage in my table. So what's gonna happen?
+Well, Aurora's gonna handle it, right? It's just gonna add more 10-gig segments and it's gonna scale up just fine.
+And you know, we're really nice fellows, we're going to bill you for it. So we're gonna bill all the storage that you actually use.
+So I've got my storage as it increments up, I'm gonna increment my bill as well.
+And as those drop existing/create news happen, it turns out that's gonna be largely steady state so my bill doesn't change.
+But then when I've got this spike, I add up that storage, and now I'm gonna pay that higher amount for the storage.
+Well, if everything then continues on a happy path, and we go back to normal sales, all of those big partitions are still gonna remain
+until they age out. So once those partitions get old and I start dropping them
+and cycling in regular-sized partitions, I'm going to use less storage, right? 'Cause I'm gonna free up,
+in this case, 100-some-odd gigabytes, and then I drop that and I drop that
+and the space inside of my server is significantly smaller. Now, this is sort of a contrived example for the screen,
+but I can assure you I've received customer calls asking why, when they just wanted to find out if Aurora really did hold 64 terabytes of data
+back in the day, and they threw in 64 terabytes of data and then they dropped it, why they were still getting a bill for 64 terabytes.
+Because this is the normal use case scenario for a database. You allocated that much space.
+Until you do something dramatic or run an operation, it's gonna be using that space.
+We'll reuse it eventually is the theory of relational database people, right? 'Cause we like to add more and more data.
+Quite literally, you'd have 64 or 128 terabytes of pages with a bunch of zeros in them.
+And we'll back those up and we'll charge you for the backups and we'll charge you for the storage, at least we would've,
+because the space is actually allocated to you, it really is used. With this new shrink feature,
+we say, "Hey, that's not great, so why don't we do this? Why don't we auto-shrink down those storage pages?"
+So now, over time, we will recover that space. Now, you'll notice that there's a slight difference
+in the lines here. Now, why is there a difference? Why isn't it exactly the smaller space that you used?
+Because you go back to that principle that we talked about before. How is Aurora storage allocated? 10-gig segments.
+So we're not gonna perfectly clean up every 10-gig segment and shrink it down to be exactly the space you used.
+There's gonna be a little bit of rounding in there, there's gonna be some segments that aren't quite full or something like that,
+so you will see a slight differentiation. But that's space that can be used and will be allocated to you,
+but we will recover the vast majority of that space now and then, therefore, lower your bill.
+So now your actual space used is gonna be very closely aligned. I have had some recent customer escalations
+wondering why they weren't seeing this. Do be aware that we still have versions active in the fleet that don't support this.
+So do make sure that if you want to use this feature, you go look at the feature page. It'll tell you what version of Aurora, MySQL, or Postgres
+you need to be on to have support for this. So you'll definitely wanna do this because, like I said, save you a bit of money.
+All right, let's talk about MySQL briefly. MySQL had a big week a couple weeks ago, shipped MySQL 8.0.
+Aurora MySQL 3 with MySQL 8.0 compatibility
+The details are all up on the slide. The big thing to know about this is a change in philosophy.
+So if you were on MySQL 5.6 or 5.7 and I told you I need to make sure
+that a fix that came in in 5.7.22 was in your version of Aurora,
+how could you figure that out? Well, you can call us and we'll dig around
+and tell you whether that change was committed, but that's a little bit awkward. How would you do that in Postgres?
+Well, if you said it's fixed in Aurora Postgres 13.4 and it's fixed in community Postgres 13.4,
+you know it's fixed in both because it's just the same community version number. Starting with MySQL 8.0.23,
+if I remember correctly, yep, 23, which we'll call Aurora 3.01,
+we will now align community versions of MySQL with the Aurora versions.
+So you'll be able to know that if something is fixed in a particular community version of MySQL8.0,
+you can map that directly back to an Aurora MySQL version in much the same way you've been able to do for quite some time with Postgres.
+So a big change in philosophy is the most important thing. And of course, lots of cool features.
+You know, if you look through the list, things like windowing functions and CTEs are obviously very, very handy.
+Improved Availability of Read Replicas
+Improved availability of read replicas, this started in MySQL 2.10, which is one of the 5.7 builds, or higher,
+and this is a feature whereby if I had that failure we talked about before,
+something went wrong with my MySQL instance, we'll try and restart the writer, so we'll just restart that process right on the server.
+But in the meantime, that'll require us to reestablish quorum as read/write owner for the cluster.
+The way we did that also threw out all the read replicas from their connection and then they had to reconnect.
+So what happens to all of your long running-read queries on your read replicas? Well, they get canceled and you have to resubmit them.
+Starting with this feature, on 2.10 or higher, those read replicas, for the most part, most of the time,
+will stay up and running even for a failover, a multi-AZ failover of the writer in MySQL.
+So that feature was rolled out for MySQL. Again, it's gonna apply for the newly released MySQL 8.0,
+and you can imagine that we're a little jealous on my side of the house. I work on the Postgres side so we'll be getting to it.
+All right. Okay.
+Oops. Wrong button, that's why. All right, Postgres updates. So the biggest thing recently
+Aurora PostgreSQL 13 new features
+was Postgres 13 late this summer. And I'm not gonna read you the list of the Postgres features
+but the point I wanted to make with this slide is we are focusing on getting major version support.
+Yes, we've heard your feedback. We added 12 and 13 since the last re:Invent.
+We're focused on getting you a preview of 14 pretty soon, and then we're gonna be looking at getting 14
+relatively early next year, at least that's the hope. So we're focusing on getting very much better at concurrency
+with these major versions for Postgres. So it's not just that Postgres 13 is really nice, and it is,
+but we are working very hard on 14. Now, philosophically though, I did wanna mention that we aren't interested
+in going after the very first release of a new major build. We wait till the first .1 release
+before we start looking at adding that out. So you won't see us release 14.0, it'll always be at least 14.1.
+All right, let's shift gears a little bit and talk about some stuff that's been either very close
+Aurora Serverless v2
+or announced here at re:Invent. The first one I wanna talk about is Serverless v2.
+Now, Serverless v2 is gonna make a lot of promises that may sound a bit familiar.
+Everything just magically works, it scales up and scales down, it scales up quite quickly, and you say, "Okay, that's great.
+That's why I want Serverless stuff." It's bullet point number three that's revolutionary here. Serverless v2 is just like a provisioned server.
+All the same capabilities that you could do with provisioned Aurora, you can now do in Serverless. So if I wanna read replica that's serverless
+and a writer node that's provisioned, okay, go ahead. You wanna have auto-scaling?
+You know, we've got these features to auto-scale read replicas and you can create groups for those, well, now just make those nodes serverless
+and they'll scale up and scale down and just work. Sorry, can you say that again? You're saying you can have serverless replica
+on a not-serverless primary? Correct, so Serverless is just another option
+so I can add a node and say I want that read replica to be serverless, but this read replica will be provisioned in a fixed size,
+in the same cluster. (indistinct) Read replicas they hit ad hoc five times a week.
+Right, and... Well, I'm not gonna talk about pricing yet
+'cause it hasn't released, but yes, absolutely. And that's the classic use case, is I need a whole lot more read replicas during the week
+or maybe sometimes I only need replicas periodically during the day, and when I'm not using them, let them scale down to nearly nothing and keep running.
+All the features that work with Aurora, including things like logical replication, now work on Serverless.
+It's just another thing you can put in your cluster. What I wanted to drill into though is buffer pool management,
+Buffer pool resizing
+'cause this is where we're doing probably the trickiest part of the work here to make Serverless really work.
+And that is we're going deep into the engines for both Postgres and MySQL to make sure we do memory allocation for shrink.
+Grow is easy, right? Give me more RAM. Okay, my buffer pool is great. I've got lots of empty pages now and I can grow stuff.
+So very, very quickly, we'll scale up and now I've got lots of extra data pages.
+And we go ahead and change the Postgres and MySQL settings to make all this work, as you'd expect. You don't have to do anything,
+it'll just change with the Serverless configuration as it detects that we need either more CPU or more memory
+and will scale up. Down, on the other hand, is tricky because we have to make sure
+that we get rid of the right data pages out of the buffer cache. 'Cause if we end up getting rid of the wrong ones,
+we'll drive up your I/O costs unnecessarily. So let's go through an example of buffer pool resizing.
+So I've got, obviously, some data pages that I'm gonna reference more often than others. So in this visualization,
+the red pages are hit very, very frequently. And then over time, you're gonna use a combination of least recently used
+and also frequency-of-access algorithms to figure out where pages rank in the hierarchy of how they're used.
+And it's not necessarily the case that it's necessarily the most recently used that's gonna be at the top.
+So for example, in this case that I've got here, I'm gonna go ahead and add a couple of page reads,
+'cause I've gone off and done some reads. They don't go at the top because I'm still using those red pages
+far more frequently than the one-time access I got from going off and fetching some data pages off disk.
+Okay, so we put them into the queue, everything works, buffer pool is fine. Now your workload slows down,
+those developers doing the reporting, they go home or they go out for lunch,
+so what's gonna happen here? Well, we've gotta figure out how to shrink that buffer pool. That means some pages need to go away.
+So we're gonna take the end of that queue, we're gonna push those pages out,
+and now we can perform the shrink operation in preparation for actually shrinking the instance size.
+So we go ahead and shrink the size of your buffer pool. Again, making sure that we evict the pages
+that not necessarily were the most recently used, but were the most recently used and the less frequently used as well,
+so both things together. And then we make all that seamlessly work in Postgres and MySQL so you'll never know.
+And you don't have to do any tuning, it just works. So that's really, in our view,
+the secret sauce that's gonna really make... I'm sure the Serverless guys that worked on the CPU scaling would disagree with me
+but I think this buffer thing is very, very cool and the secret sauce that really makes Serverless really exciting.
+Plus, can't emphasize enough, doing all the same stuff that a provisioned instance will do. So it's really gonna change, I think,
+the shape of a lot of Aurora clusters. If you were at the keynote this morning,
+you saw that we've launched DevOps Guru for RDS. So what is DevOps Guru? Well, there's the marketing page.
+Introducing Amazon DevOps Guru for RDS
+ML-powered capability to automatically detect, diagnose, and tell you about operational things that you'll wanna fix.
+What's really going on behind the scenes? This only works on Performance Insights-enabled clusters. That should give you a hint
+of what we're actually doing behind the scenes. We're using Performance Insights data to figure out when we see anomalies.
+So here I've got a Performance Insight anomaly-detection mechanism.
+It sees that something went wrong there. And so it goes and looks and says, "What was different? What did we find?"
+Well, in this case we saw, hey, look at that, there's a bunch of extra locking going on and there's the queries that caused that extra locking.
+So what do we do about that? Well, maybe in this case, it's because there was too much memory pressure
+So now we'll run that through our algorithms and if everything looks like, hey, that's probably something you could do
+and you might need to take action on that, then we'll pop up alerts to you saying, "Hey, we found this anomaly.
+The way you would address that is by performing the following actions." And we'll give that messaging back to you
+so that you can take actions instead of having to dig into all these logs yourself.
+All right, migration, let's talk a bit about migration. So this is not new, I'm not gonna spend a whole lot of time on it.
+Migration to Aurora: Methods
+Most of the migration methods that we've had before and had for a few years are still here. DMS and SCT are still very, very popular.
+We're getting very, very large numbers of databases migrated now.
+From a perspective of what is Aurora? You'll always hear us use the legal name,
+Aurora Postgres MySQL-compatible edition, or excuse me, Amazon Aurora MySQL-Compatible Edition,
+Amazon Aurora Postgres-Compatible Edition. That does not mean it's not really MySQL or Postgres running under the covers.
+It's absolutely running the code, plus all the Aurora goodness wrapped around it.
+So that means things like pg_dump and pg_restore work perfectly fine on Aurora. It means that MySQL can take their backups with mysqldump,
+you can use Percona XtraBackup, because it really is the MySQL interface, it really is the MySQL core system,
+it really is Postgres running there, so I can migrate in or out, by the way,
+with any of those tools. If you're on RDS, you can do a snapshot import, or a feature that we frequently see used these days
+is RDS read replica migration, so just a couple of slides on this. If I've got RDS running with, let's say, Postgres,
+Migration: Read replica
+I can create a read replica that's actually an Aurora cluster. So we're gonna go ahead and set up that read replica.
+We'll take a snapshot, we'll restore it into Aurora, then we'll catchup via asynchronous replication,
+and then I can promote that Aurora cluster, and now I've effectively failed over from RDS to Aurora.
+So that's a nice migration method if you choose to migrate from RDS to Aurora.
+But we've got a new option this year, shipped a few weeks ago, and that's Babelfish.
+So Babelfish is an open source project. We've released it into the community.
+So babelfishpg.org is the home of the code, so you can actually go look at the source code
+and see what we've done. We're also shipping it as part of Aurora Postgres 13.
+Babelfish for Aurora PostgreSQL
+So what's Babelfish all about? Babelfish is about commercial migration. So we get an awful lot of customers
+asking us to move from SQL Server to Aurora Postgres. How would you have done that?
+You go out with SCT, figure out how to migrate your schema, you use DMS to do a migration from SQL Server into Postgres,
+and then you start the hard part, you gotta convert all your applications. What Babelfish does is it implements
+not only additional compatibility with T-SQL, but it implements the Wire Protocol
+so that I can take a SQL Server application, speaking the SQL Server Wire Protocol and have it listen on the Aurora Postgres instance,
+and your developer application will think it's talking to SQL Server 'cause it's gonna use all the same protocols.
+So we're gonna go through and make that look like it's still gonna think it's still talking to a SQL Server.
+Now, we are not trying to replicate SQL Server here. We are trying to migrate you to Aurora Postgres. So this is an acceleration mechanism
+to get you moved over to Aurora. So what are you gonna see here? You're gonna see your regular Postgres port 5432
+or whatever port you wanna put it on, and your regular Postgres applications work. You're still talking to Aurora Postgres.
+But if you turn on Babelfish, you'll also see port 1433, SQL Server's default, or whatever port you wanna put it on,
+and you can connect, with a SQL Server application, to Aurora Postgres.
+Now, are you talking to the same Aurora instance? Absolutely, you'll still have a cluster endpoint, you'll just change the port number
+and you'll use the TDS stream protocol instead of the Postgres protocol to connect.
+How did we do that? We did that because Postgres has a fantastic extension model.
+So if you have a regular Postgres extension that you might use all the time without thinking about it, like pg_stat_statements, you probably don't think about it
+because Postgres just extends itself with this mechanism. So we took advantage of that extension mechanism
+for Babelfish and we said, "Okay, let's go ahead and add Babelfish T-SQL enhancements."
+So we've taken a bunch of the T-SQL language constructs and implemented them in Postgres as an extension.
+Guess what? We also then implemented a TDS listener. TDS, Tabular Data Stream's the Wire Protocol for SQL Server,
+it's open source, it's public, so we built a listener for Postgres and published it and it hooks in
+and then queries can connect up and run using those SQL Server drivers and that Wire Protocol.
+Throw on top of that some common functionality and the money datatype, 'cause there were some funky variations there
+that we'll not get into here, and you've got Postgres, except Postgres that now speaks T-SQL
+and now talks SQL Server driver language. So if I wanna migrate, I have a second option.
+I can still use SCT and DMS and migrate directly into Postgres,
+but then I've gotta convert all my applications. With Babelfish, I can say, "You know what? I'm gonna do a partial step."
+I'm gonna bring over things, but I'm gonna bring them over as if they were SQL Server. I'm gonna keep my T-SQL applications,
+I'm gonna bring over MySQL data with SQL data types, not converting them to Postgres, and I'm gonna just move my applications
+and point them from MySQL Server at my Aurora Postgres instance. And voila, I've migrated a lot faster than it would've been
+if you had to go convert all of those applications to speak natively to Postgres, and now you can do the rest of the migration
+at your leisure, assuming you want to do the rest of the migration. If you're happy with Babelfish, you can stay on it. If you wanna finish migrating natively into Postgres,
+you can do that over time. All right, so Postgres clients, again, gonna use port 5432 like we talked about,
+SQL clients connect up. Again, exactly the same cluster of Postgres, the same instance so nothing different there,
+Migrating SQL Server database structure
+but how did we make that happen? Well, here's a simple diagram of exactly what's going on under the covers.
+On the right is a SQL Server description. And this is a very standard layout of SQL Server.
+If you're a SQL Server person, you'll say, "Well, yeah, of course." And if you're not, well, you can decipher this slide later.
+But you've got your system databases, master, tempdb, model, msdb, those sorts of system databases
+are normal in a SQL Server instance. And then I create my user databases. In the slide example here,
+I've got a dbA, a dbB, and dbC database. When I migrate into Babelfish,
+we actually create a custom database in Postgres. I shouldn't say custom, it's a Postgres database,
+except it's always called babelfish_db, and then we use schemas inside of that database to emulate SQL Server databases.
+So when you come in through the Babelfish endpoint and you say use database a, because that's what I was using on SQL Server,
+we'll put you into that schema inside of the Babelfish database. And then when you run your T-SQL queries,
+Postgres is wonderfully extendable, it now speaks T-SQL in addition to regular Postgres
+so it can now run your SQL queries and return the results over that data. But it's still in Postgres,
+so if I wanna start up Postgres admin and connect up and troll through all this and say, "Hey, where's all the data?
+And could I point at that data and grab a copy of it and use it in Postgres?" The answer is absolutely yes 'cause it's in Postgres.
+So now I have migrated my data but I still let my applications work as if I were still thinking I'm talking to SQL Server,
+so a really good acceleration mechanism. Now, this is a V1, we just launched it,
+it's out in the open source community. We intend to be serious about that open source so we hope that you will go grab this project
+and add the T-SQL features that we haven't done yet. Now, we're gonna be publishing a roadmap on GitHub, we're gonna be developing in GitHub,
+so it really is gonna be an open source project, it really is gonna be a series of extensions, and periodically, we're gonna snapshot that code,
+pull it back into Aurora, and ship it. So you're gonna see regular updates on Aurora, but you're also gonna see community updates
+making their way into Aurora now, just like they would with any other extension that is developed in the community.
+All right, so that's Babelfish and we're super excited about that. Little short on Aurora sessions at re:Invent this year,
+you may have noticed. Just me and Serverless for the breakout sessions, as well as Rudi's What's New in RDS,
+but we have a number of breakouts, Chalk Talks, and builders' sessions. Strongly encourage you to participate, get your hands on it,
+talk to the experts that have flown in here to make your re:Invent experience better. Really wanna thank you for staying this late
+and I appreciate your coming to re:Invent this year and thank you very much.
